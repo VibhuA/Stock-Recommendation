@@ -45,7 +45,7 @@ top_5_now = current_momentum.nlargest(5)
 cols = st.columns(5)
 for i, (stock, val) in enumerate(top_5_now.items()):
     with cols[i]:
-        st.metric(label=f"Rank {i+1}", value=stock, delta=f"{val*100:.2f}% Mom")
+        st.metric(label=f"Rank {i+1}", value=stock, delta=f"{val*100:.2f}% (6m)")
 
 st.info(f"**Action:** Allocate 20% to each. Set SL at -{sl_pct*100}% and TP at +{tp_pct*100}%.")
 
