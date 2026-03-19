@@ -94,7 +94,7 @@ results_df = pd.DataFrame(monthly_stats).set_index('Month')
 # Metrics Calculation
 total_years = (data.index[-1] - data.index[0]).days / 365.25
 cagr = (((current_cash / 100) ** (1 / total_years)) - 1) * 100
-sharpe = (results_df['Return%'].mean() / results_df['Return%'].std()) * np.sqrt(12)
+sharpe = ((results_df['Return%'].mean()-.005) / results_df['Return%'].std()) * np.sqrt(12)
 
 # Display Summary Metrics
 m1, m2, m3 = st.columns(3)
