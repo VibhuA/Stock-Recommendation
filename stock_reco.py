@@ -1,114 +1,165 @@
-import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import datetime
+import itertools
+from datetime import datetime
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="Momentum Trading Dashboard", layout="wide")
-st.title("🚀 Nifty 50 Momentum Strategy")
-st.write("Backtest results and live stock suggestions based on 6-month relative momentum.")
+# ---------------------------------------------------------
+# 1. PARAMETERS & UNIVERSE SETUP
+# ---------------------------------------------------------
+START_DATE = "2022-01-01"
+BACKTEST_START = "2023-01-01"
+END_DATE = datetime.today().strftime('%Y-%m-%d')
+print("Enter Investment Amount")
+INITIAL_CAPITAL = int(input())#100000.0
+MAX_POSITIONS = 5  # Exactly 5 positions target
 
-# --- PARAMETERS & TICKERS ---
-SYMBOLS = [
-    'ADANIENT.NS', 'ADANIPORTS.NS', 'APOLLOHOSP.NS', 'ASIANPAINT.NS', 'AXISBANK.NS',
-    'BAJAJ-AUTO.NS', 'BAJFINANCE.NS', 'BAJAJFINSV.NS', 'BPCL.NS', 'BHARTIARTL.NS',
-    'BRITANNIA.NS', 'CIPLA.NS', 'COALINDIA.NS', 'DIVISLAB.NS', 'DRREDDY.NS',
-    'EICHERMOT.NS', 'GRASIM.NS', 'HCLTECH.NS', 'HDFCBANK.NS',
-    'HEROMOTOCO.NS', 'HINDALCO.NS', 'HINDUNILVR.NS', 'ICICIBANK.NS', 
-    'INDUSINDBK.NS', 'INFY.NS', 'JSWSTEEL.NS', 'KOTAKBANK.NS', 'LTIM.NS',
-    'LT.NS', 'M&M.NS', 'MARUTI.NS', 'NTPC.NS', 'NESTLEIND.NS',
-    'ONGC.NS', 'POWERGRID.NS', 'RELIANCE.NS', 'SBILIFE.NS', 'SHRIRAMFIN.NS',
-    'SBIN.NS',  'TCS.NS',  'TATASTEEL.NS', 'TECHM.NS',  'ULTRACEMCO.NS', 
+# Selected Strategy Parameters
+MOMENTUM_DAYS = 20        # 20 Lookback Days
+STOP_LOSS_PCT = 0.08      # 8% Hard Stop
+TRAILING_STOP_PCT = 0.08  # 8% Trailing Stop
+
+NIFTY_50_TICKERS = [
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
+    "BHARTIARTL.NS", "SBIN.NS", "ITC.NS", "LT.NS", "HINDUNILVR.NS",
+    "AXISBANK.NS", "KOTAKBANK.NS", "M&M.NS", "NTPC.NS", "POWERGRID.NS",
+    "MARUTI.NS", "SUNPHARMA.NS", "TITAN.NS", "ULTRACEMCO.NS", "ASIANPAINT.NS",
+    "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "BAJFINANCE.NS"
 ]
 
-# --- DATA FETCHING (CACHED) ---
-@st.cache_data(ttl=3600)
-def load_data(tickers):
-    data = yf.download(tickers, start='2020-01-01', end=datetime.datetime.now().strftime('%Y-%m-%d'))['Close']
-    return data.ffill().bfill()
+print("Downloading dataset...")
+df_download = yf.download(NIFTY_50_TICKERS, start=START_DATE, end=END_DATE, progress=False)
+prices = df_download['Close'].dropna(how='all', axis=1).ffill()
 
-data = load_data(SYMBOLS)
-
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("Strategy Settings")
-sl_pct = st.sidebar.slider("Stop Loss (%)", 1.0, 10.0, 3.0) / 100
-tp_pct = st.sidebar.slider("Take Profit (%)", 5.0, 20.0, 10.0) / 100
-fees_pct = st.sidebar.number_input("Transaction Fees (%)", value=0.3) / 100
-
-# --- LIVE SUGGESTIONS SECTION ---
-st.subheader("🎯 Live Suggestions for Today")
-current_momentum = data.pct_change(125).iloc[-1]
-top_5_now = current_momentum.nlargest(5)
-
-cols = st.columns(5)
-for i, (stock, val) in enumerate(top_5_now.items()):
-    with cols[i]:
-        st.metric(label=f"Rank {i+1}", value=stock, delta=f"{val*100:.2f}% (6m)")
-
-st.info(f"**Action:** Allocate 20% to each. Set SL at -{sl_pct*100}% and TP at +{tp_pct*100}%.")
-
-# --- BACKTEST LOGIC ---
-st.divider()
-st.subheader("📈 Backtest Performance")
-
-momentum = data.pct_change(125).fillna(0)
-current_cash = 100.0
-monthly_stats = []
-
-for period, group in data.groupby(pd.Grouper(freq='MS')):
-    if len(group) < 2: continue
-    start_date = group.index[0]
-    top_5 = momentum.loc[start_date].nlargest(5).index.tolist()
+# ---------------------------------------------------------
+# 2. STRATEGY ENGINE & RECOMMENDATION GENERATOR
+# ---------------------------------------------------------
+def run_backtest_and_signal(prices, momentum_days, stop_loss_pct, trailing_stop_pct, max_positions=5):
+    ema_50 = prices.ewm(span=50, adjust=False).mean()
     
-    cash_per_stock = current_cash / 5
-    monthly_pnl = 0
+    portfolio = {}
+    cash = INITIAL_CAPITAL
+    portfolio_history = []
     
-    for stock in top_5:
-        prices = group[stock]
-        entry_price = prices.iloc[0]
-        exit_price = prices.iloc[-1]
+    trading_days = prices.loc[BACKTEST_START:END_DATE].index
+
+    for current_date in trading_days:
+        current_prices = prices.loc[current_date]
         
-        pct_change = (prices / entry_price) - 1
-        sl_hit = pct_change[pct_change <= -sl_pct]
-        tp_hit = pct_change[pct_change >= tp_pct]
-        
-        if not sl_hit.empty and (tp_hit.empty or sl_hit.index[0] < tp_hit.index[0]):
-            exit_price = entry_price * (1 - sl_pct)
-        elif not tp_hit.empty:
-            exit_price = entry_price * (1 + tp_pct)
+        # A. Exits (Hard & Trailing Stop Loss)
+        tickers_to_remove = []
+        for ticker, pos in portfolio.items():
+            price = current_prices[ticker]
+            if pd.isna(price):
+                continue
             
-        stock_return = (exit_price / entry_price) - 1 - fees_pct
-        monthly_pnl += cash_per_stock * stock_return
+            if price > pos['highest_price']:
+                pos['highest_price'] = price
+                
+            hard_stop_price = pos['buy_price'] * (1 - stop_loss_pct)
+            trailing_stop_price = pos['highest_price'] * (1 - trailing_stop_pct)
+            
+            if price <= hard_stop_price or price <= trailing_stop_price:
+                cash += pos['shares'] * price
+                tickers_to_remove.append(ticker)
+                
+        for t in tickers_to_remove:
+            del portfolio[t]
+
+        # B. Entries (Ranked by 20-Day Momentum & 50 EMA Filter)
+        open_slots = max_positions - len(portfolio)
+        if open_slots > 0 and cash > 10000:
+            past_idx = prices.index.get_loc(current_date) - momentum_days
+            if past_idx >= 0:
+                past_prices = prices.iloc[past_idx]
+                momentum_scores = (current_prices - past_prices) / past_prices
+                
+                trend_mask = current_prices > ema_50.loc[current_date]
+                valid_scores = momentum_scores[trend_mask].drop(labels=list(portfolio.keys()), errors='ignore')
+                
+                top_candidates = valid_scores.nlargest(open_slots)
+                allocation_per_slot = cash / open_slots
+                
+                for ticker, score in top_candidates.items():
+                    price = current_prices[ticker]
+                    if not pd.isna(price) and price > 0 and score > 0:
+                        shares = int(allocation_per_slot // price)
+                        if shares > 0:
+                            cash -= shares * price
+                            portfolio[ticker] = {
+                                'buy_price': price,
+                                'highest_price': price,
+                                'buy_date': current_date,
+                                'shares': shares
+                            }
+
+        # C. Valuation Tracking
+        holdings_val = sum(pos['shares'] * current_prices[t] for t, pos in portfolio.items() if not pd.isna(current_prices[t]))
+        portfolio_history.append(cash + holdings_val)
+
+    # ---------------------------------------------------------
+    # LIVE REBALANCING SIGNAL SHEET (EXACTLY 5 STOCKS)
+    # ---------------------------------------------------------
+    latest_prices = prices.iloc[-1]
+    past_prices_latest = prices.iloc[-1 - momentum_days]
+    
+    momentum_scores_latest = (latest_prices - past_prices_latest) / past_prices_latest
+    trend_mask_latest = trend_and_positive_mask = (latest_prices > ema_50.iloc[-1]) & (momentum_scores_latest > 0)
+    
+    
+    # Filter candidates above 50 EMA
+    valid_candidates = momentum_scores_latest[trend_mask_latest]
+    
+    # Fallback to top relative momentum if fewer than 5 stocks pass 50 EMA
+    #if len(valid_candidates) < max_positions:
+    #    top_recommendations = momentum_scores_latest.nlargest(max_positions)
+    #else:
+    top_recommendations = valid_candidates.nlargest(max_positions)
         
-    monthly_stats.append({
-        'Month': period, 
-        'Return%': (monthly_pnl/current_cash)*100,
-        'Stocks': ", ".join(top_5)
-    })
-    current_cash += monthly_pnl
+    slot_budget = INITIAL_CAPITAL / len(valid_candidates)#max_positions
+    
+    order_sheet = []
+    
+    for ticker, score in top_recommendations.items():
+        price = latest_prices[ticker]
+        above_ema = bool(trend_mask_latest[ticker])
+        print(trend_mask_latest[ticker])
+        shares = int(slot_budget // price)
+        stop_price = round(price * (1 - stop_loss_pct), 2)
+        
+        order_sheet.append({
+            'Ticker': ticker,
+            'Price (INR)': round(price, 2),
+            f'{momentum_days}D Momentum (%)': round(score * 100, 2),
+            'Above 50 EMA': "YES" if above_ema else "NO (Fallback)",
+            'Recommended Shares': shares,
+            'Allocated Capital (INR)': round(shares * price, 2),
+            'Hard Stop-Loss (INR)': stop_price
+        })
 
-results_df = pd.DataFrame(monthly_stats).set_index('Month')
+    # Performance
+    final_val = portfolio_history[-1]
+    years = (prices.index[-1] - datetime.strptime(BACKTEST_START, "%Y-%m-%d")).days / 365.25
+    cagr = (((final_val / INITIAL_CAPITAL) ** (1 / years)) - 1) * 100
 
-# Metrics Calculation
-total_years = (data.index[-1] - data.index[0]).days / 365.25
-cagr = (((current_cash / 100) ** (1 / total_years)) - 1) * 100
-sharpe = ((results_df['Return%'].mean()-.5) / results_df['Return%'].std()) * np.sqrt(12)
+    return pd.DataFrame(order_sheet), round(cagr, 2), round(final_val, 2)
 
-# Display Summary Metrics
-m1, m2, m3 = st.columns(3)
-m1.metric("Final Portfolio Value", f"₹{current_cash:.2f}")
-m2.metric("CAGR", f"{cagr:.2f}%")
-m3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+# ---------------------------------------------------------
+# 3. RUN STRATEGY WITH YOUR PARAMETERS
+# ---------------------------------------------------------
+recommendations_df, cagr, final_val = run_backtest_and_signal(
+    prices, 
+    momentum_days=MOMENTUM_DAYS, 
+    stop_loss_pct=STOP_LOSS_PCT, 
+    trailing_stop_pct=TRAILING_STOP_PCT,
+    max_positions=MAX_POSITIONS
+)
 
-# Charting
-fig, ax = plt.subplots(figsize=(10, 4))
-ax.plot(results_df.index, results_df['Return%'].cumsum(), color='#1E88E5', linewidth=2)
-ax.set_title("Cumulative Returns (%)")
-ax.grid(True, alpha=0.2)
-st.pyplot(fig)
-
-# Table
-st.write("### Monthly Breakdown")
-st.dataframe(results_df[['Return%', 'Stocks']].sort_index(ascending=False), use_container_width=True)
+print("\n" + "="*80)
+print(f"       LIVE EXECUTION SHEET (20-Day Momentum | 8% Stop | 8% Trailing)      ")
+print("="*80)
+print(f"Historical Backtest CAGR: {cagr}%")
+print(f"Starting Capital: ₹{INITIAL_CAPITAL:,.2f}  |  Historical Growth Value: ₹{final_val:,.2f}")
+print("-" * 80)
+print(recommendations_df.to_string(index=False))
+print("="*80)
