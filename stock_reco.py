@@ -68,7 +68,7 @@ def load_data():
 # ---------------------------------------------------------
 def run_backtest_and_signal(prices, index_prices, initial_capital, momentum_days, stop_loss_pct, trailing_stop_pct, max_positions=5):
     ema_50 = prices.ewm(span=50, adjust=False).mean()
-    index_ema_50 = index_prices.ewm(span=50, adjust=False).mean()
+    index_ema_50 = index_prices.ewm(span=10, adjust=False).mean()
     
     portfolio = {}
     cash = initial_capital
