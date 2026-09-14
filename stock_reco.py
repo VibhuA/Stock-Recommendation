@@ -1,23 +1,42 @@
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import itertools
 from datetime import datetime
 
 # ---------------------------------------------------------
-# 1. PARAMETERS & UNIVERSE SETUP
+# 1. PAGE CONFIGURATION
 # ---------------------------------------------------------
+st.set_page_config(
+    page_title="Nifty 50 Momentum Strategy",
+    page_icon="📈",
+    layout="wide"
+)
+
+st.title("📈 Nifty 50 Momentum Strategy Dashboard")
+st.markdown("Automated backtesting and live trading recommendations using 20-Day Momentum, 50 EMA Trend Filter, and Trailing Stops.")
+
+# ---------------------------------------------------------
+# 2. SIDEBAR INPUTS & PARAMETERS
+# ---------------------------------------------------------
+st.sidebar.header("Strategy Parameters")
+
+INITIAL_CAPITAL = st.sidebar.number_input(
+    "Investment Amount (INR)",
+    min_value=10000.0,
+    max_value=100000000.0,
+    value=500000.0,
+    step=10000.0
+)
+
+MAX_POSITIONS = st.sidebar.number_input("Max Target Positions", min_value=1, max_value=10, value=5)
+MOMENTUM_DAYS = st.sidebar.slider("Momentum Lookback (Days)", min_value=5, max_value=252, value=20)
+STOP_LOSS_PCT = st.sidebar.slider("Hard Stop Loss (%)", min_value=0.01, max_value=0.20, value=0.08, step=0.01)
+TRAILING_STOP_PCT = st.sidebar.slider("Trailing Stop Loss (%)", min_value=0.01, max_value=0.20, value=0.08, step=0.01)
+
 START_DATE = "2022-01-01"
 BACKTEST_START = "2023-01-01"
 END_DATE = datetime.today().strftime('%Y-%m-%d')
-print("Enter Investment Amount")
-INITIAL_CAPITAL = int(input())#100000.0
-MAX_POSITIONS = 5  # Exactly 5 positions target
-
-# Selected Strategy Parameters
-MOMENTUM_DAYS = 20        # 20 Lookback Days
-STOP_LOSS_PCT = 0.08      # 8% Hard Stop
-TRAILING_STOP_PCT = 0.08  # 8% Trailing Stop
 
 NIFTY_50_TICKERS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
@@ -27,18 +46,23 @@ NIFTY_50_TICKERS = [
     "TATASTEEL.NS", "JSWSTEEL.NS", "ADANIENT.NS", "BAJFINANCE.NS"
 ]
 
-print("Downloading dataset...")
-df_download = yf.download(NIFTY_50_TICKERS, start=START_DATE, end=END_DATE, progress=False)
-prices = df_download['Close'].dropna(how='all', axis=1).ffill()
+# ---------------------------------------------------------
+# 3. DATA LOADING (CACHED FOR PERFORMANCE)
+# ---------------------------------------------------------
+@st.cache_data(ttl=3600)
+def load_data():
+    df_download = yf.download(NIFTY_50_TICKERS, start=START_DATE, end=END_DATE, progress=False)
+    prices = df_download['Close'].dropna(how='all', axis=1).ffill()
+    return prices
 
 # ---------------------------------------------------------
-# 2. STRATEGY ENGINE & RECOMMENDATION GENERATOR
+# 4. BACKTEST ENGINE & SIGNAL GENERATOR
 # ---------------------------------------------------------
-def run_backtest_and_signal(prices, momentum_days, stop_loss_pct, trailing_stop_pct, max_positions=5):
+def run_backtest_and_signal(prices, initial_capital, momentum_days, stop_loss_pct, trailing_stop_pct, max_positions=5):
     ema_50 = prices.ewm(span=50, adjust=False).mean()
     
     portfolio = {}
-    cash = INITIAL_CAPITAL
+    cash = initial_capital
     portfolio_history = []
     
     trading_days = prices.loc[BACKTEST_START:END_DATE].index
@@ -98,68 +122,76 @@ def run_backtest_and_signal(prices, momentum_days, stop_loss_pct, trailing_stop_
         portfolio_history.append(cash + holdings_val)
 
     # ---------------------------------------------------------
-    # LIVE REBALANCING SIGNAL SHEET (EXACTLY 5 STOCKS)
+    # LIVE REBALANCING SIGNAL SHEET
     # ---------------------------------------------------------
     latest_prices = prices.iloc[-1]
     past_prices_latest = prices.iloc[-1 - momentum_days]
     
     momentum_scores_latest = (latest_prices - past_prices_latest) / past_prices_latest
-    trend_mask_latest = trend_and_positive_mask = (latest_prices > ema_50.iloc[-1]) & (momentum_scores_latest > 0)
+    trend_and_positive_mask = (latest_prices > ema_50.iloc[-1]) & (momentum_scores_latest > 0)
+    trend_mask_latest = trend_and_positive_mask
     
-    
-    # Filter candidates above 50 EMA
+    # Filter candidates above 50 EMA and with positive momentum
     valid_candidates = momentum_scores_latest[trend_mask_latest]
     
-    # Fallback to top relative momentum if fewer than 5 stocks pass 50 EMA
-    #if len(valid_candidates) < max_positions:
-    #    top_recommendations = momentum_scores_latest.nlargest(max_positions)
-    #else:
     top_recommendations = valid_candidates.nlargest(max_positions)
         
-    slot_budget = INITIAL_CAPITAL / len(valid_candidates)#max_positions
+    slot_budget = initial_capital / (len(valid_candidates) if len(valid_candidates) > 0 else 1)
     
     order_sheet = []
     
     for ticker, score in top_recommendations.items():
         price = latest_prices[ticker]
         above_ema = bool(trend_mask_latest[ticker])
-        print(trend_mask_latest[ticker])
-        shares = int(slot_budget // price)
+        shares = int(slot_budget // price) if price > 0 else 0
         stop_price = round(price * (1 - stop_loss_pct), 2)
         
         order_sheet.append({
             'Ticker': ticker,
             'Price (INR)': round(price, 2),
             f'{momentum_days}D Momentum (%)': round(score * 100, 2),
-            'Above 50 EMA': "YES" if above_ema else "NO (Fallback)",
+            'Above 50 EMA & Positive': "YES" if above_ema else "NO",
             'Recommended Shares': shares,
             'Allocated Capital (INR)': round(shares * price, 2),
             'Hard Stop-Loss (INR)': stop_price
         })
 
-    # Performance
+    # Performance Calculation
     final_val = portfolio_history[-1]
     years = (prices.index[-1] - datetime.strptime(BACKTEST_START, "%Y-%m-%d")).days / 365.25
-    cagr = (((final_val / INITIAL_CAPITAL) ** (1 / years)) - 1) * 100
+    cagr = (((final_val / initial_capital) ** (1 / years)) - 1) * 100
 
-    return pd.DataFrame(order_sheet), round(cagr, 2), round(final_val, 2)
+    history_df = pd.DataFrame({'Portfolio Value': portfolio_history}, index=trading_days)
+
+    return pd.DataFrame(order_sheet), round(cagr, 2), round(final_val, 2), history_df
 
 # ---------------------------------------------------------
-# 3. RUN STRATEGY WITH YOUR PARAMETERS
+# 5. EXECUTION & DISPLAY
 # ---------------------------------------------------------
-recommendations_df, cagr, final_val = run_backtest_and_signal(
-    prices, 
-    momentum_days=MOMENTUM_DAYS, 
-    stop_loss_pct=STOP_LOSS_PCT, 
-    trailing_stop_pct=TRAILING_STOP_PCT,
-    max_positions=MAX_POSITIONS
-)
+if st.button("Run Strategy & Generate Signals", type="primary"):
+    with st.spinner("Fetching market data and running backtest..."):
+        prices = load_data()
+        
+        recommendations_df, cagr, final_val, history_df = run_backtest_and_signal(
+            prices,
+            initial_capital=INITIAL_CAPITAL,
+            momentum_days=MOMENTUM_DAYS,
+            stop_loss_pct=STOP_LOSS_PCT,
+            trailing_stop_pct=TRAILING_STOP_PCT,
+            max_positions=MAX_POSITIONS
+        )
 
-print("\n" + "="*80)
-print(f"       LIVE EXECUTION SHEET (20-Day Momentum | 8% Stop | 8% Trailing)      ")
-print("="*80)
-print(f"Historical Backtest CAGR: {cagr}%")
-print(f"Starting Capital: ₹{INITIAL_CAPITAL:,.2f}  |  Historical Growth Value: ₹{final_val:,.2f}")
-print("-" * 80)
-print(recommendations_df.to_string(index=False))
-print("="*80)
+    # Metric Cards
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Starting Capital", f"₹{INITIAL_CAPITAL:,.2f}")
+    col2.metric("Historical Growth Value", f"₹{final_val:,.2f}")
+    col3.metric("Backtest CAGR", f"{cagr}%")
+
+    st.subheader("📋 Recommended Positions")
+    if not recommendations_df.empty:
+        st.dataframe(recommendations_df, use_container_width=True)
+    else:
+        st.warning("No stocks currently satisfy both the 50 EMA trend filter and positive momentum condition.")
+
+    st.subheader("📈 Historical Equity Curve")
+    st.line_chart(history_df)
