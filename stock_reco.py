@@ -14,7 +14,7 @@ st.set_page_config(
 )
 
 st.title("📈 Nifty 50 Momentum Strategy Dashboard")
-st.markdown("Automated backtesting and live trading recommendations using 20-Day Momentum, Stock & Index 50 EMA Trend Filters, and Trailing Stops.")
+st.markdown("Automated backtesting and live trading recommendations using 20-Day Momentum, 50 EMA Trend Filter, and Trailing Stops.")
 
 # ---------------------------------------------------------
 # 2. SIDEBAR INPUTS & PARAMETERS
@@ -38,8 +38,6 @@ START_DATE = "2022-01-01"
 BACKTEST_START = "2023-01-01"
 END_DATE = datetime.today().strftime('%Y-%m-%d')
 
-INDEX_TICKER = "^NSEI"
-
 NIFTY_50_TICKERS = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "INFY.NS", "ICICIBANK.NS",
     "BHARTIARTL.NS", "SBIN.NS", "ITC.NS", "LT.NS", "HINDUNILVR.NS",
@@ -53,22 +51,15 @@ NIFTY_50_TICKERS = [
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_data():
-    all_tickers = NIFTY_50_TICKERS + [INDEX_TICKER]
-    df_download = yf.download(all_tickers, start=START_DATE, end=END_DATE, progress=False)
+    df_download = yf.download(NIFTY_50_TICKERS, start=START_DATE, end=END_DATE, progress=False)
     prices = df_download['Close'].dropna(how='all', axis=1).ffill()
-    
-    # Separate index data from stock data
-    index_prices = prices[INDEX_TICKER]
-    stock_prices = prices.drop(columns=[INDEX_TICKER])
-    
-    return stock_prices, index_prices
+    return prices
 
 # ---------------------------------------------------------
 # 4. BACKTEST ENGINE & SIGNAL GENERATOR
 # ---------------------------------------------------------
-def run_backtest_and_signal(prices, index_prices, initial_capital, momentum_days, stop_loss_pct, trailing_stop_pct, max_positions=5):
+def run_backtest_and_signal(prices, initial_capital, momentum_days, stop_loss_pct, trailing_stop_pct, max_positions=5):
     ema_50 = prices.ewm(span=50, adjust=False).mean()
-    index_ema_50 = index_prices.ewm(span=10, adjust=False).mean()
     
     portfolio = {}
     cash = initial_capital
@@ -91,23 +82,18 @@ def run_backtest_and_signal(prices, index_prices, initial_capital, momentum_days
                 
             hard_stop_price = pos['buy_price'] * (1 - stop_loss_pct)
             trailing_stop_price = pos['highest_price'] * (1 - trailing_stop_pct)
-            ema_val_remove = ema_50.loc[current_date, ticker]
+            ema_val_remove = ema_50.loc[current_date, ticker] # Fetch current day's EMA
             
-            if price <= hard_stop_price or price <= trailing_stop_price or price < ema_val_remove:
+            if price <= hard_stop_price or price <= trailing_stop_price or price <ema_val_remove:
                 cash += pos['shares'] * price
                 tickers_to_remove.append(ticker)
                 
         for t in tickers_to_remove:
             del portfolio[t]
 
-        # B. Entries (Index Filter + Stock Filter + Momentum)
-        # Check if the Nifty 50 index is trading above its 50 EMA
-        is_index_bullish = index_prices.loc[current_date] > index_ema_50.loc[current_date]
-        
+        # B. Entries (Ranked by 20-Day Momentum & 50 EMA Filter)
         open_slots = max_positions - len(portfolio)
-        
-        # Only buy if the overall market/index trend is bullish
-        if is_index_bullish and open_slots > 0 and cash > 10000:
+        if open_slots > 0 and cash > 10000:
             past_idx = prices.index.get_loc(current_date) - momentum_days
             if past_idx >= 0:
                 past_prices = prices.iloc[past_idx]
@@ -139,38 +125,37 @@ def run_backtest_and_signal(prices, index_prices, initial_capital, momentum_days
     # ---------------------------------------------------------
     # LIVE REBALANCING SIGNAL SHEET
     # ---------------------------------------------------------
-    latest_index_price = index_prices.iloc[-1]
-    latest_index_ema = index_ema_50.iloc[-1]
-    is_index_bullish_now = latest_index_price > latest_index_ema
-
     latest_prices = prices.iloc[-1]
     past_prices_latest = prices.iloc[-1 - momentum_days]
     
     momentum_scores_latest = (latest_prices - past_prices_latest) / past_prices_latest
     trend_and_positive_mask = (latest_prices > ema_50.iloc[-1]) & (momentum_scores_latest > 0)
+    trend_mask_latest = trend_and_positive_mask
+    
+    # Filter candidates above 50 EMA and with positive momentum
+    valid_candidates = momentum_scores_latest[trend_mask_latest]
+    
+    top_recommendations = valid_candidates.nlargest(max_positions)
+        
+    slot_budget = initial_capital / (len(valid_candidates) if len(valid_candidates) > 0 else 1)
     
     order_sheet = []
     
-    # If the index is not above its 50 EMA, reject all buy signals
-    if is_index_bullish_now:
-        valid_candidates = momentum_scores_latest[trend_and_positive_mask]
-        top_recommendations = valid_candidates.nlargest(max_positions)
-        slot_budget = initial_capital / (len(top_recommendations) if len(top_recommendations) > 0 else 1)
+    for ticker, score in top_recommendations.items():
+        price = latest_prices[ticker]
+        above_ema = bool(trend_mask_latest[ticker])
+        shares = int(slot_budget // price) if price > 0 else 0
+        stop_price = round(price * (1 - stop_loss_pct), 2)
         
-        for ticker, score in top_recommendations.items():
-            price = latest_prices[ticker]
-            shares = int(slot_budget // price) if price > 0 else 0
-            stop_price = round(price * (1 - stop_loss_pct), 2)
-            
-            order_sheet.append({
-                'Ticker': ticker,
-                'Price (INR)': round(price, 2),
-                f'{momentum_days}D Momentum (%)': round(score * 100, 2),
-                'Above 50 EMA': "YES",
-                'Recommended Shares': shares,
-                'Allocated Capital (INR)': round(shares * price, 2),
-                'Hard Stop-Loss (INR)': stop_price
-            })
+        order_sheet.append({
+            'Ticker': ticker,
+            'Price (INR)': round(price, 2),
+            f'{momentum_days}D Momentum (%)': round(score * 100, 2),
+            'Above 50 EMA & Positive': "YES" if above_ema else "NO",
+            'Recommended Shares': shares,
+            'Allocated Capital (INR)': round(shares * price, 2),
+            'Hard Stop-Loss (INR)': stop_price
+        })
 
     # Performance Calculation
     final_val = portfolio_history[-1]
@@ -179,31 +164,23 @@ def run_backtest_and_signal(prices, index_prices, initial_capital, momentum_days
 
     history_df = pd.DataFrame({'Portfolio Value': portfolio_history}, index=trading_days)
 
-    return pd.DataFrame(order_sheet), round(cagr, 2), round(final_val, 2), history_df, is_index_bullish_now, round(latest_index_price, 2), round(latest_index_ema, 2)
+    return pd.DataFrame(order_sheet), round(cagr, 2), round(final_val, 2), history_df
 
 # ---------------------------------------------------------
 # 5. EXECUTION & DISPLAY
 # ---------------------------------------------------------
 if st.button("Run Strategy & Generate Signals", type="primary"):
     with st.spinner("Fetching market data and running backtest..."):
-        prices, index_prices = load_data()
+        prices = load_data()
         
-        recommendations_df, cagr, final_val, history_df, is_index_bullish, index_px, index_ema = run_backtest_and_signal(
+        recommendations_df, cagr, final_val, history_df = run_backtest_and_signal(
             prices,
-            index_prices,
             initial_capital=INITIAL_CAPITAL,
             momentum_days=MOMENTUM_DAYS,
             stop_loss_pct=STOP_LOSS_PCT,
             trailing_stop_pct=TRAILING_STOP_PCT,
             max_positions=MAX_POSITIONS
         )
-
-    # Market Status Indicator
-    st.subheader("🌐 Market Regimen (Nifty 50 Filter)")
-    if is_index_bullish:
-        st.success(f"**BULLISH REGIMEN**: Nifty 50 (`{index_px:,.2f}`) is ABOVE 50 EMA (`{index_ema:,.2f}`). Trade entries allowed.")
-    else:
-        st.error(f"**BEARISH REGIMEN**: Nifty 50 (`{index_px:,.2f}`) is BELOW 50 EMA (`{index_ema:,.2f}`). New purchases paused.")
 
     # Metric Cards
     col1, col2, col3 = st.columns(3)
@@ -212,12 +189,10 @@ if st.button("Run Strategy & Generate Signals", type="primary"):
     col3.metric("Backtest CAGR", f"{cagr}%")
 
     st.subheader("📋 Recommended Positions")
-    if not is_index_bullish:
-        st.warning("No stock recommendations generated because the Nifty 50 Index is currently below its 50-day EMA.")
-    elif not recommendations_df.empty:
+    if not recommendations_df.empty:
         st.dataframe(recommendations_df, use_container_width=True)
     else:
-        st.warning("No individual stocks currently meet both the 50 EMA trend filter and positive momentum conditions.")
+        st.warning("No stocks currently satisfy both the 50 EMA trend filter and positive momentum condition.")
 
     st.subheader("📈 Historical Equity Curve")
     st.line_chart(history_df)
