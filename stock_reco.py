@@ -82,8 +82,9 @@ def run_backtest_and_signal(prices, initial_capital, momentum_days, stop_loss_pc
                 
             hard_stop_price = pos['buy_price'] * (1 - stop_loss_pct)
             trailing_stop_price = pos['highest_price'] * (1 - trailing_stop_pct)
+            ema_val_remove = ema_50.loc[current_date, ticker] # Fetch current day's EMA
             
-            if price <= hard_stop_price or price <= trailing_stop_price:
+            if price <= hard_stop_price or price <= trailing_stop_price or price <ema_val_remove:
                 cash += pos['shares'] * price
                 tickers_to_remove.append(ticker)
                 
